@@ -199,11 +199,15 @@ impl ConfigValidator {
             || prediction.return_time_min_support == 0
             || prediction.output_length_min_support == 0
             || prediction.output_length_tail_samples == 0
-            || prediction.stability_window_size == 0
             || prediction.step_bucket_size == 0
         {
             return Err(ConfigError::ValidationFailed {
                 reason: "Prediction profile intervals, weights, supports, windows, and limits must be valid and non-zero".to_string(),
+            });
+        }
+        if prediction.stability_window_size < 2 {
+            return Err(ConfigError::ValidationFailed {
+                reason: "Prediction profile stability_window_size must be at least 2".to_string(),
             });
         }
         if !prediction.return_time_horizon_seconds.is_finite()
@@ -1085,6 +1089,18 @@ mod tests {
         ];
         for config in invalid {
             assert!(ConfigValidator::validate_program_scheduling(&config).is_err());
+        }
+    }
+
+    #[test]
+    fn prediction_stability_window_requires_two_observations() {
+        let mut config = ProgramSchedulingConfig::default();
+        for window in [0, 1, 2, 100] {
+            config.prediction_profile.stability_window_size = window;
+            assert_eq!(
+                ConfigValidator::validate_program_scheduling(&config).is_ok(),
+                window >= 2
+            );
         }
     }
 

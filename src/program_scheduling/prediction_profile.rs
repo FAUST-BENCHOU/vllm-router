@@ -375,6 +375,14 @@ impl PredictionProfileStore {
 
         let mut output_length = HashMap::with_capacity(profile.output_length_profiles.len());
         for entry in profile.output_length_profiles {
+            if entry.bucket_counts.last().is_some_and(|count| *count > 0.0)
+                && entry.max_observed_tokens <= *self.output_length_bounds.last().unwrap_or(&0.0)
+            {
+                return Err(
+                    "output-length overflow bucket requires max_observed_tokens above the final bucket bound"
+                        .to_string(),
+                );
+            }
             let histogram = Histogram::from_seed(
                 &entry.bucket_counts,
                 0.0,
@@ -441,6 +449,10 @@ impl PredictionProfileStore {
             }
             let counts = histogram.effective_counts(prior_weight);
             let no_return = histogram.effective_no_return(prior_weight);
+            let overflow_upper = overflow_upper_bound(
+                &self.return_time_bounds,
+                histogram.effective_max_observed(prior_weight),
+            );
             let mut survivors = no_return;
             let mut future_returns = 0.0;
             for (index, count) in counts.iter().enumerate() {
@@ -448,7 +460,7 @@ impl PredictionProfileStore {
                     .return_time_bounds
                     .get(index)
                     .copied()
-                    .unwrap_or(f64::INFINITY);
+                    .unwrap_or(overflow_upper);
                 if upper > elapsed {
                     survivors += count;
                 }
@@ -598,6 +610,16 @@ impl PredictionProfileStore {
     }
 }
 
+// Use the observed maximum as the conservative endpoint of the overflow bucket.
+// A seed without a known overflow maximum retains an unknown (infinite) endpoint.
+fn overflow_upper_bound(bounds: &[f64], max_observed: f64) -> f64 {
+    if max_observed > bounds.last().copied().unwrap_or(0.0) {
+        max_observed
+    } else {
+        f64::INFINITY
+    }
+}
+
 fn best_ttl(
     counts: &[f64],
     no_return: f64,
@@ -612,16 +634,12 @@ fn best_ttl(
     }
     let max_ttl = max_ttl.min(cache_miss_cost);
     let mut best = (0.0, 0.0);
-    let last_bound = bounds.last().copied().unwrap_or(0.0);
-    let overflow_upper = if max_observed > last_bound {
-        max_observed
-    } else {
-        f64::INFINITY
-    };
+    let overflow_upper = overflow_upper_bound(bounds, max_observed);
     for candidate in std::iter::once(0.0).chain(
         bounds
             .iter()
             .copied()
+            .chain(std::iter::once(overflow_upper))
             .filter(|bound| *bound <= max_ttl)
             .chain(std::iter::once(max_ttl)),
     ) {
@@ -735,6 +753,99 @@ mod tests {
 
         assert_eq!(fast, 1.0);
         assert_eq!(slow, 0.0);
+    }
+
+    #[test]
+    fn overflow_return_prediction_uses_observed_upper_bound() {
+        let key = ReturnTimeKey {
+            workflow_profile_id: None,
+            profile_version: None,
+            model_pool: None,
+            agent_role: None,
+            spawn_reason: None,
+            blocks_parent: None,
+            expected_resume: None,
+            step_bucket: None,
+        };
+        let mut store = PredictionProfileStore::empty(vec![1.0, 2.0, 5.0, 10.0], vec![64], 16, 4);
+        for _ in 0..100 {
+            store.observe_return(std::slice::from_ref(&key), 12.0);
+            store.observe_no_return(std::slice::from_ref(&key));
+        }
+        let prediction = store
+            .predict_return(std::slice::from_ref(&key), 0.0, 20.0, 20, 1.0, 40.0, 30.0)
+            .unwrap();
+        assert_eq!(prediction.probability, 0.5);
+        assert_eq!(prediction.suggested_ttl_seconds, 12.0);
+        // The overflow bucket must not count as a hit before its upper bound.
+        let early = store
+            .predict_return(&[key], 0.0, 10.0, 20, 1.0, 40.0, 10.0)
+            .unwrap();
+        assert_eq!(early.probability, 0.0);
+        assert_eq!(early.suggested_ttl_seconds, 0.0);
+    }
+
+    #[test]
+    fn best_ttl_considers_overflow_upper_bound_with_no_return_mass() {
+        assert_eq!(
+            best_ttl(
+                &[0.0, 0.0, 0.0, 0.0, 100.0],
+                100.0,
+                &[1.0, 2.0, 5.0, 10.0],
+                40.0,
+                30.0,
+                12.0,
+            ),
+            12.0
+        );
+    }
+
+    #[test]
+    fn output_seed_requires_valid_maximum_when_overflow_is_populated() {
+        for maximum in [None, Some(0.0), Some(8192.0), Some(12000.0)] {
+            let mut entry = serde_json::json!({
+                "key": output_key(),
+                "bucket_counts": [0.0, 100.0]
+            });
+            if let Some(maximum) = maximum {
+                entry["max_observed_tokens"] = serde_json::json!(maximum);
+            }
+            let raw = serde_json::json!({
+                "schema_version": "1",
+                "return_time_bucket_bounds_seconds": [1.0],
+                "output_length_bucket_bounds_tokens": [8192],
+                "output_length_profiles": [entry]
+            })
+            .to_string();
+            let valid = maximum.is_some_and(|value| value > 8192.0);
+            assert_eq!(
+                validate_profile_json(&raw, &[1.0], &[8192], 16).is_ok(),
+                valid
+            );
+            if valid {
+                let mut store = PredictionProfileStore::empty(vec![1.0], vec![8192], 16, 4);
+                store
+                    .load_profile(serde_json::from_str(&raw).unwrap())
+                    .unwrap();
+                let prediction = store
+                    .predict_output(&[output_key()], 0.95, 1, 1, 1.0, 4, 0.15)
+                    .unwrap();
+                assert_eq!(prediction.p95, 12000);
+                assert_eq!(prediction.p99, 12000);
+            }
+        }
+    }
+
+    #[test]
+    fn output_seed_without_overflow_can_omit_maximum() {
+        let raw = serde_json::json!({
+            "schema_version": "1",
+            "return_time_bucket_bounds_seconds": [1.0],
+            "output_length_bucket_bounds_tokens": [64],
+            "output_length_profiles": [{"key": output_key(), "bucket_counts": [100, 0]}]
+        })
+        .to_string();
+        assert!(validate_profile_json(&raw, &[1.0], &[64], 16).is_ok());
     }
 
     #[test]
